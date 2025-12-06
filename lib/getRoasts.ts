@@ -2,6 +2,11 @@
 import { getRoastIds } from "./getRoastIds";
 import { logging } from "./logging";
 
+interface AlarmHit {
+  name: string;
+  timestamp?: string;
+}
+
 function addMinutes(iso: string, minutes: number): string {
   const d = new Date(iso);
   return new Date(d.getTime() + minutes * 60 * 1000).toISOString();
@@ -93,6 +98,7 @@ function normalizeAlarmNames(raw: string | null): string[] {
     "set",
     "setTag",
     "Tag",
+    "Name",
   ]);
   const names: string[] = [];
   for (const m of matches) {
@@ -180,12 +186,43 @@ timestamp <= "${endIso}"
   };
 }
 
+async function fetchRoastProfileId(
+  serial: string,
+  startIso: string,
+  endIso: string
+) {
+  const filter = `
+logName="projects/bw-core/logs/roaster"
+labels.serial="${serial}"
+timestamp >= "${startIso}"
+timestamp <= "${endIso}"
+(textPayload:"RPId=" OR jsonPayload.message:"RPId=")
+`.trim();
+
+  const [entries] = await logging.getEntries({
+    filter,
+    orderBy: "timestamp asc",
+    pageSize: 100,
+  });
+
+  for (const entry of entries) {
+    const text = messageFromEntry(entry);
+    if (!text) continue;
+    const match = text.match(/RPId=([A-Za-z0-9]+)/);
+    if (match && match[1]) {
+      return match[1];
+    }
+  }
+
+  return "";
+}
+
 async function fetchRoastAlarms(
   serial: string,
   startIso: string,
   endIso: string,
   endBoundary?: string
-) {
+): Promise<AlarmHit[]> {
   const filter = `
 logName="projects/bw-core/logs/roaster"
 labels.serial="${serial}"
@@ -200,7 +237,7 @@ timestamp <= "${endIso}"
     pageSize: 200,
   });
 
-  const alarms = new Set<string>();
+  const alarms = new Map<string, string | undefined>();
   let seenActive = false;
 
   for (const entry of entries) {
@@ -214,6 +251,9 @@ timestamp <= "${endIso}"
     const text = messageFromEntry(entry);
     if (!text) continue;
 
+    // Skip clear alarm housekeeping logs
+    if (/CLEAR_FAILURE_ALARM/i.test(text)) continue;
+
     // Skip empty ActiveAlarms sections
     const isActiveSection = /ActiveAlarms/i.test(text);
     if (/ActiveAlarms:\s*\[\s*\]/i.test(text)) {
@@ -226,7 +266,9 @@ timestamp <= "${endIso}"
     const rawName = extractAlarmName(text);
     const names = normalizeAlarmNames(rawName);
     for (const n of names) {
-      alarms.add(n);
+      if (!alarms.has(n)) {
+        alarms.set(n, ts);
+      }
     }
 
     const pastEnd = endBoundary ? ts >= endBoundary : true;
@@ -235,7 +277,7 @@ timestamp <= "${endIso}"
     }
   }
 
-  return Array.from(alarms);
+  return Array.from(alarms.entries()).map(([name, ts]) => ({ name, timestamp: ts }));
 }
 
 export async function getRoasts(
@@ -328,7 +370,7 @@ export async function getRoasts(
       const cursorParam = r.startTime ? `;cursorTimestamp=${encodeURIComponent(r.startTime)}` : "";
 
       // Fetch alarms in the roast window
-      let alarms: string[] = [];
+      let alarms: AlarmHit[] = [];
       try {
         const alarmStart = r.startTime;
         const alarmEnd = r.endTime && r.endTime !== ""
@@ -341,6 +383,7 @@ export async function getRoasts(
 
       // Cooling info (search from roast end to a reasonable window)
       let coolingDurationSeconds: number | null = null;
+      let roastProfileId = "";
       try {
         const coolingStart = r.endTime && r.endTime !== "" ? r.endTime : r.startTime;
         const coolingEndWindow = addMinutes(coolingStart, 120);
@@ -348,6 +391,9 @@ export async function getRoasts(
         if (Number.isFinite(cooling.coolingDurationSeconds as number)) {
           coolingDurationSeconds = cooling.coolingDurationSeconds as number;
         }
+
+        // Roast Profile ID lookup near roast start window
+        roastProfileId = await fetchRoastProfileId(serial, r.startTime, coolingEndWindow);
       } catch (err) {
         console.error("Error fetching cooling for", r.id, err);
       }
@@ -360,6 +406,7 @@ export async function getRoasts(
         hasAlarms: alarms.length > 0,
         alarms,
         coolingDurationSeconds: coolingDurationSeconds ?? null,
+        roastProfileId,
         gcpLink: `https://console.cloud.google.com/logs/query;query=${query}${startParam}${endParam}${cursorParam}?project=bw-core`,
       };
     })

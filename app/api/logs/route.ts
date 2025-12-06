@@ -1,20 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
-import { exec } from "child_process";
+import { logging } from "../../../lib/logging";
 
 export const runtime = "nodejs";
-
-function execShell(cmd: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    exec(cmd, { maxBuffer: 1024 * 5000 }, (err, stdout, stderr) => {
-      if (err) return reject(stderr || err);
-      resolve(stdout);
-    });
-  });
-}
 
 export async function GET(req: NextRequest) {
   try {
     const serial = req.nextUrl.searchParams.get("serial");
+    const windowMinutes = Number(req.nextUrl.searchParams.get("windowMinutes") || "15");
     if (!serial) {
       return NextResponse.json(
         { error: "Missing serial parameter" },
@@ -22,21 +14,28 @@ export async function GET(req: NextRequest) {
       );
     }
 
-    const cmd = `
-      gcloud logging read "labels.serial='${serial}'" \
-      --project=bw-core --limit=500 --format=json
-    `;
+    const minutes = Number.isFinite(windowMinutes) && windowMinutes > 0 ? windowMinutes : 15;
+    const startIso = new Date(Date.now() - minutes * 60 * 1000).toISOString();
 
-    const raw = await execShell(cmd);
+    const filter = `
+logName="projects/bw-core/logs/roaster"
+labels.serial="${serial}"
+timestamp >= "${startIso}"
+`.trim();
 
-    const entries = JSON.parse(raw);
+    const [entries] = await logging.getEntries({
+      filter,
+      orderBy: "timestamp desc",
+      pageSize: 200,
+    });
 
-    // Map into simplified format
-    const parsed = entries.map((e: any) => ({
+    const parsed = (entries || []).map((e: any) => ({
       timestamp: e.timestamp,
       severity: e.severity || "",
       message: e.textPayload || e.jsonPayload?.message || "",
       labels: e.labels,
+      receiveTimestamp: e.receiveTimestamp,
+      metadata: e.metadata,
     }));
 
     return NextResponse.json({ serial, count: parsed.length, logs: parsed });
