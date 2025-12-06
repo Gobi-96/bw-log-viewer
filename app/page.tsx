@@ -1,7 +1,7 @@
 // app/page.tsx
 "use client";
 
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useState, useMemo } from "react";
 
 interface RoasterSummary {
   serial: string;
@@ -13,11 +13,12 @@ interface RoasterSummary {
 
 interface RoastSummary {
   id: string;
+  roastProfileId?: string;
   startTime: string;
   endTime: string;
   durationSeconds: number;
   hasAlarms: boolean;
-  alarms: string[];
+  alarms: { name: string; timestamp?: string }[];
   gcpLink: string;
   coolingDurationSeconds?: number | null;
 }
@@ -79,8 +80,200 @@ export default function HomePage() {
   const [roastsLoading, setRoastsLoading] = useState(false);
   const [roastsError, setRoastsError] = useState<string | null>(null);
   const [currentPage, setCurrentPage] = useState(1);
+  const [statusInfo, setStatusInfo] = useState<{ state: "online" | "offline" | "unknown"; label: string; lastSeen?: string; }>(
+    { state: "unknown", label: "Status unknown" }
+  );
+  const [downloadingId, setDownloadingId] = useState<string | null>(null);
 
   const pageSize = 10;
+
+  const liveLogsUrl = useMemo(() => {
+    if (!selectedRoaster) return "";
+    const query = encodeURIComponent(
+      `logName="projects/bw-core/logs/roaster"\nlabels.serial="${selectedRoaster.serial}"`
+    );
+    return `https://console.cloud.google.com/logs/query;query=${query};timeRange=PT1H?project=bw-core`;
+  }, [selectedRoaster]);
+
+  function todayLocalISO() {
+    // Format local date as YYYY-MM-DD without timezone shifts
+    const d = new Date();
+    const year = d.getFullYear();
+    const month = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    return `${year}-${month}-${day}`;
+  }
+
+  function formatSince(dateStr: string) {
+    const ts = new Date(dateStr).getTime();
+    if (!Number.isFinite(ts)) return "";
+    const diffMs = Date.now() - ts;
+    if (diffMs < 0) return "";
+    const minutes = Math.floor(diffMs / (60 * 1000));
+    const hours = Math.floor(minutes / 60);
+    const days = Math.floor(hours / 24);
+    const weeks = Math.floor(days / 7);
+    const years = Math.floor(days / 365);
+
+    if (minutes < 60) return `${minutes}m ago`;
+    if (hours < 24) return `${hours}h ago`;
+    if (days < 14) return `${days}d ago`;
+    if (weeks < 52) return `${weeks}w ago`;
+    return `${years}y ago`;
+  }
+
+  function normalizeLogTimestamp(ts: any): number | null {
+    if (!ts) return null;
+    if (typeof ts === "string") {
+      const n = new Date(ts).getTime();
+      return Number.isFinite(n) ? n : null;
+    }
+    if (ts instanceof Date) {
+      const n = ts.getTime();
+      return Number.isFinite(n) ? n : null;
+    }
+    if (typeof ts === "object") {
+      const seconds = Number((ts as any).seconds ?? (ts as any)._seconds ?? 0);
+      const nanos = Number((ts as any).nanos ?? (ts as any)._nanos ?? 0);
+      if (!Number.isFinite(seconds)) return null;
+      return seconds * 1000 + Math.floor(nanos / 1e6);
+    }
+    return null;
+  }
+
+  function alarmLink(r: RoastSummary, alarmName: string, alarmTs?: string) {
+    const serial = selectedRoaster?.serial || "";
+    if (!serial) return "";
+    const centerIso = alarmTs || r.startTime;
+    const query = encodeURIComponent(
+      `logName="projects/bw-core/logs/roaster"\nlabels.serial="${serial}"\n${alarmName}`
+    );
+    const cursorParam = centerIso ? `;cursorTimestamp=${encodeURIComponent(centerIso)}` : "";
+    const startParam = centerIso
+      ? `;startTime=${encodeURIComponent(new Date(new Date(centerIso).getTime() - 5 * 60 * 1000).toISOString())}`
+      : "";
+    const endParam = centerIso
+      ? `;endTime=${encodeURIComponent(new Date(new Date(centerIso).getTime() + 5 * 60 * 1000).toISOString())}`
+      : "";
+    return `https://console.cloud.google.com/logs/query;query=${query}${startParam}${endParam}${cursorParam}?project=bw-core`;
+  }
+
+  async function handleDownloadLogs(roast: RoastSummary) {
+    if (!selectedRoaster) return;
+    const start = roast.startTime;
+    if (!start) return;
+    let end = roast.endTime;
+    if (!end) {
+      end = new Date(new Date(start).getTime() + 60 * 60 * 1000).toISOString();
+    } else if (roast.coolingDurationSeconds && roast.coolingDurationSeconds > 0) {
+      end = new Date(new Date(end).getTime() + roast.coolingDurationSeconds * 1000).toISOString();
+    }
+
+    const params = new URLSearchParams();
+    params.set("serial", selectedRoaster.serial);
+    params.set("roastId", roast.id);
+    params.set("start", start);
+    if (end) params.set("end", end);
+    params.set("slackSeconds", "10");
+
+    function filenameFromDisposition(header: string | null): string | null {
+      if (!header) return null;
+      // Examples: attachment; filename="PS00015_12_6_2025_18_47_36.csv"
+      const match = header.match(/filename\\*?=([^;]+)/i);
+      if (!match || !match[1]) return null;
+      return decodeURIComponent(match[1].trim().replace(/^\"|\"$/g, ""));
+    }
+
+    try {
+      setDownloadingId(roast.id);
+      const res = await fetch(`/api/downloadLogs?${params.toString()}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const blob = await res.blob();
+      const headerName = filenameFromDisposition(res.headers.get("Content-Disposition"));
+      const fallbackName = `logs-${selectedRoaster.serial}-${roast.id}.csv`;
+      const downloadName = headerName || fallbackName;
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = downloadName;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error("Failed to download logs", err);
+      setRoastsError("Failed to download logs");
+    } finally {
+      setDownloadingId(null);
+    }
+  }
+
+  function statusFromTimestamp(dateStr: string, thresholdMinutes = 60) {
+    if (!dateStr) return { state: "unknown" as const, label: "Status unknown" };
+    const t = new Date(dateStr).getTime();
+    if (!Number.isFinite(t)) return { state: "unknown" as const, label: "Status unknown" };
+    const minutes = (Date.now() - t) / (60 * 1000);
+    if (minutes <= thresholdMinutes) return { state: "online" as const, label: "Online", lastSeen: new Date(t).toISOString() };
+    return {
+      state: "offline" as const,
+      label: `Offline • Last seen ${formatSince(new Date(t).toISOString())}`,
+      lastSeen: new Date(t).toISOString(),
+    };
+  }
+
+  // Refresh online status from latest logs for the selected roaster
+  useEffect(() => {
+    if (!selectedRoaster) {
+      setStatusInfo({ state: "unknown", label: "Status unknown" });
+      return;
+    }
+    // Start in checking state to avoid flashing offline before we know
+    setStatusInfo({ state: "unknown", label: "Checking status…" });
+
+    const controller = new AbortController();
+
+    (async () => {
+      try {
+        const res = await fetch(`/api/logs?serial=${encodeURIComponent(selectedRoaster.serial)}&windowMinutes=60`, {
+          signal: controller.signal,
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        const timestamps: number[] = (data.logs || [])
+          .map((l: any) =>
+            normalizeLogTimestamp(l.timestamp) ??
+            normalizeLogTimestamp(l.timeStamp) ??
+            normalizeLogTimestamp(l.time) ??
+            normalizeLogTimestamp(l.receiveTimestamp) ??
+            normalizeLogTimestamp(l.metadata?.timestamp)
+          )
+          .filter((n: number | null) => Number.isFinite(n)) as number[];
+
+        const latest = Math.max(...timestamps, -Infinity);
+        if (Number.isFinite(latest) || (data.logs || []).length > 0) {
+          const lastIso = Number.isFinite(latest) ? new Date(latest).toISOString() : undefined;
+          setStatusInfo({ state: "online", label: "Online", lastSeen: lastIso });
+          return;
+        }
+
+        // No logs in window; if we have lastSeen, show offline relative to it; else unknown
+        if (selectedRoaster.lastSeen) {
+          setStatusInfo(statusFromTimestamp(selectedRoaster.lastSeen, 60));
+        } else {
+          setStatusInfo({ state: "unknown", label: "Status unknown" });
+        }
+      } catch (err) {
+        if (controller.signal.aborted) return;
+        if (selectedRoaster.lastSeen) {
+          setStatusInfo(statusFromTimestamp(selectedRoaster.lastSeen, 60));
+        } else {
+          setStatusInfo({ state: "unknown", label: "Status unknown" });
+        }
+      }
+    })();
+
+    return () => controller.abort();
+  }, [selectedRoaster]);
 
   // ==============================
   // LOAD ROASTERS ON APP START
@@ -137,11 +330,14 @@ export default function HomePage() {
     setCurrentPage(1);
 
     // Set defaults to today's date
-    const today = new Date().toISOString().slice(0, 10);
+    const today = todayLocalISO();
     setFromDate(today);
     setToDate(today);
     setFromTime("00:00");
     setToTime("23:59");
+    const fromIso = combineDateTime(today, "00:00");
+    const toIso = combineDateTime(today, "23:59");
+    fetchRoasts(1, { roaster, from: fromIso, to: toIso });
   }
 
   // ==============================
@@ -158,23 +354,28 @@ export default function HomePage() {
   // ==============================
   // FETCH ROASTS
   // ==============================
-  async function fetchRoasts(page: number) {
-    if (!selectedRoaster) return;
-
-    if (!fromDate || !toDate) {
-      setRoastsError("Select both date values");
-      return;
-    }
+  async function fetchRoasts(
+    page: number,
+    overrides?: { roaster?: RoasterSummary; from?: string; to?: string }
+  ) {
+    const roaster = overrides?.roaster ?? selectedRoaster;
+    if (!roaster) return;
 
     setRoastsLoading(true);
     setRoastsError(null);
 
-    const fromIso = combineDateTime(fromDate, fromTime);
-    const toIso = combineDateTime(toDate, toTime);
-    
+    if (!overrides?.from && (!fromDate || !toDate)) {
+      setRoastsError("Select both date values");
+      setRoastsLoading(false);
+      return;
+    }
+
+    const fromIso = overrides?.from ?? combineDateTime(fromDate, fromTime);
+    const toIso = overrides?.to ?? combineDateTime(toDate, toTime);
+
 
     const params = new URLSearchParams();
-    params.set("serial", selectedRoaster.serial);
+    params.set("serial", roaster.serial);
     params.set("from", fromIso);
     params.set("to", toIso);
     params.set("page", String(page));
@@ -283,6 +484,28 @@ export default function HomePage() {
               <div className="panel-subtitle">
                 {selectedRoaster.serial}
                 {selectedRoaster.machineName && " • " + selectedRoaster.machineName}
+                <span
+                  className={`status-chip ${
+                    statusInfo.state === "online"
+                      ? "status-chip--online"
+                      : statusInfo.state === "offline"
+                      ? "status-chip--offline"
+                      : "status-chip--unknown"
+                  }`}
+                  title={
+                    statusInfo.state === "offline" && statusInfo.lastSeen
+                      ? `Last seen ${new Date(statusInfo.lastSeen).toLocaleString()}`
+                      : undefined
+                  }
+                >
+                  <span className="status-dot" />
+                  {statusInfo.label}
+                </span>
+                {liveLogsUrl && (
+                  <a className="status-link" href={liveLogsUrl} target="_blank" rel="noopener noreferrer">
+                    Live logs →
+                  </a>
+                )}
               </div>
             ) : (
               <div className="panel-subtitle">Select a roaster on the left</div>
@@ -324,12 +547,14 @@ export default function HomePage() {
   <thead>
   <tr>
     <th>Roast ID</th>
+    <th>Roast Profile ID</th>
     <th>Date</th>
     <th>Start Time</th>
     <th>End Time</th>
     <th>Duration</th>
     <th>Active Alarms</th>
     <th>Cooling Duration</th>
+    <th>Download Logs</th>
     <th>GCP Logs</th>
   </tr>
 </thead>
@@ -338,25 +563,32 @@ export default function HomePage() {
   {roastPage.roasts.map(r => (
     <tr key={r.id}>
       <td className="mono">{r.id}</td>
+      <td className="mono">{r.roastProfileId || "N/A"}</td>
       <td>{formatDateTime(r.startTime, timeZone).split(",")[0]}</td>
       <td>{formatTime(r.startTime, timeZone)}</td>
       <td>{r.endTime ? formatTime(r.endTime, timeZone) : "N/A"}</td>
       <td>{r.endTime ? formatDuration(r.durationSeconds) : "N/A"}</td>
       <td>
-        {r.hasAlarms ? (
-          <>
-            <span className="tag tag--danger">✓ Yes</span>
-                {r.alarms && r.alarms.length > 0 && (
-                  <div className="alarm-list">
-                    {r.alarms.map((name, idx) => (
-                      <span key={name + idx} className="alarm-chip">
-                        {name}
-                      </span>
-                    ))}
-                  </div>
-                )}
-          </>
-        ) : (
+                {r.hasAlarms ? (
+                  <>
+                    <span className="tag tag--danger">✓ Yes</span>
+                    {r.alarms && r.alarms.length > 0 && (
+                      <div className="alarm-list">
+                        {r.alarms.map((alarm, idx) => (
+                          <a
+                            key={alarm.name + idx}
+                            className="alarm-chip"
+                            href={alarmLink(r, alarm.name, alarm.timestamp)}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                          >
+                            {alarm.name}
+                          </a>
+                        ))}
+                      </div>
+                    )}
+                  </>
+                ) : (
           <span className="tag tag--ok">✗ No</span>
         )}
       </td>
@@ -364,6 +596,16 @@ export default function HomePage() {
         {r.coolingDurationSeconds && r.coolingDurationSeconds > 0
           ? formatDuration(r.coolingDurationSeconds)
           : "N/A"}
+      </td>
+      <td>
+        <button
+          className="icon-btn"
+          title="Download logs"
+          onClick={() => handleDownloadLogs(r)}
+          disabled={!!downloadingId}
+        >
+          {downloadingId === r.id ? "⏳" : "⬇"}
+        </button>
       </td>
       <td>
         <a

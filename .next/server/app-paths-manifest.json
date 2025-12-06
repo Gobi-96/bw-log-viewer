@@ -1,4 +1,7 @@
 {
-  "/api/roasts/route": "app/api/roasts/route.js",
-  "/page": "app/page.js"
+  "/api/roasters/route": "app/api/roasters/route.js",
+  "/page": "app/page.js",
+  "/api/logs/route": "app/api/logs/route.js",
+  "/api/downloadLogs/route": "app/api/downloadLogs/route.js",
+  "/api/roasts/route": "app/api/roasts/route.js"
 }
