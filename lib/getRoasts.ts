@@ -191,6 +191,26 @@ function parseCoolingDuration(text: string): { seconds: number; label: string } 
   return null;
 }
 
+async function mapWithConcurrency<T, U>(
+  items: T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<U>
+): Promise<U[]> {
+  const results: U[] = new Array(items.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (nextIndex < items.length) {
+      const i = nextIndex++;
+      results[i] = await fn(items[i], i);
+    }
+  }
+
+  const workers = Array.from({ length: Math.max(1, limit) }, () => worker());
+  await Promise.all(workers);
+  return results;
+}
+
 async function fetchCoolingInfo(
   serial: string,
   startIso: string,
@@ -433,8 +453,7 @@ export async function getRoasts(
   const end = start + pageSize;
   const slice = groupedList.slice(start, end);
 
-  const roasts = await Promise.all(
-    slice.map(async r => {
+  const roasts = await mapWithConcurrency(slice, 3, async r => {
       let durationSeconds = r.startTime && r.endTime
         ? Math.max(0, (new Date(r.endTime).getTime() - new Date(r.startTime).getTime()) / 1000)
         : 0;
@@ -523,8 +542,7 @@ export async function getRoasts(
         status,
         gcpLink: `https://console.cloud.google.com/logs/query;query=${query}${startParam}${endParam}${cursorParam}?project=bw-core`,
       };
-    })
-  );
+    });
 
   return {
     page,

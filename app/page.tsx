@@ -90,7 +90,7 @@ export default function HomePage() {
   }>({ state: "unknown", label: "Status unknown" });
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
 
-  const pageSize = 20;
+  const pageSize = 10;
 
   const liveLogsUrl = useMemo(() => {
     if (!selectedRoaster) return "";
