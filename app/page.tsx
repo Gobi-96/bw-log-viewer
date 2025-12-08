@@ -14,6 +14,7 @@ interface RoasterSummary {
 interface RoastSummary {
   id: string;
   roastProfileId?: string;
+  roastSeq?: number | null;
   startTime: string;
   endTime: string;
   durationSeconds: number;
@@ -21,6 +22,7 @@ interface RoastSummary {
   alarms: { name: string; timestamp?: string }[];
   gcpLink: string;
   coolingDurationSeconds?: number | null;
+  status?: "success" | "in_progress" | "failed";
 }
 
 interface RoastPage {
@@ -80,12 +82,15 @@ export default function HomePage() {
   const [roastsLoading, setRoastsLoading] = useState(false);
   const [roastsError, setRoastsError] = useState<string | null>(null);
   const [currentPage, setCurrentPage] = useState(1);
-  const [statusInfo, setStatusInfo] = useState<{ state: "online" | "offline" | "unknown"; label: string; lastSeen?: string; }>(
-    { state: "unknown", label: "Status unknown" }
-  );
+  const [statusInfo, setStatusInfo] = useState<{
+    state: "online" | "offline" | "unknown";
+    label: string;
+    lastSeen?: string;
+    machineState?: { label: string; tone: "ready" | "preheat" | "roast" | "cool" | "standby" | "other" };
+  }>({ state: "unknown", label: "Status unknown" });
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
 
-  const pageSize = 10;
+  const pageSize = 20;
 
   const liveLogsUrl = useMemo(() => {
     if (!selectedRoaster) return "";
@@ -208,11 +213,73 @@ export default function HomePage() {
     }
   }
 
+  function parseStateFromMessage(msg: string | undefined | null): string | null {
+    if (!msg) return null;
+    const lower = msg.toLowerCase();
+
+    // Prefer explicit transitions: "... to Ready"
+    const trans = lower.match(/state transition[^:]*:\s*[^>]*\bto\b\s*([a-z]+)/i);
+    if (trans && trans[1]) return trans[1];
+
+    // Generic "State: Ready"
+    const stateAssign = lower.match(/\bstate\s*[:=]\s*([a-z]+)/i);
+    if (stateAssign && stateAssign[1]) return stateAssign[1];
+
+    // Keyword fallback
+    const keywords: Record<string, string[]> = {
+      ready: ["ready"],
+      preheat: ["preheat", "pre-heat", "pre heat"],
+      roast: ["roast", "roasting"],
+      cool: ["cool", "cooling"],
+      standby: ["standby", "idle"],
+    };
+
+    for (const [state, words] of Object.entries(keywords)) {
+      for (const w of words) {
+        if (lower.includes(w)) return state;
+      }
+    }
+
+    return null;
+  }
+
+  function deriveMachineState(logs: any[]): { label: string; tone: "ready" | "preheat" | "roast" | "cool" | "standby" | "other" } | undefined {
+    // Logs come newest-first from API; iterate to find the first with a recognizable state
+    for (const log of logs || []) {
+      const msg: string | undefined =
+        log.message ||
+        log.textPayload ||
+        log.jsonPayload?.message ||
+        log.metadata?.textPayload;
+
+      const stateRaw = parseStateFromMessage(msg);
+      if (!stateRaw) continue;
+
+      const normalized = stateRaw.toLowerCase();
+      if (normalized.includes("ready")) return { label: "Ready", tone: "ready" };
+      if (normalized.includes("pre")) return { label: "Preheat", tone: "preheat" };
+      if (normalized.includes("roast")) return { label: "Roast", tone: "roast" };
+      if (normalized.includes("cool")) return { label: "Cool", tone: "cool" };
+      if (normalized.includes("standby") || normalized.includes("idle")) return { label: "Standby", tone: "standby" };
+      return { label: stateRaw.charAt(0).toUpperCase() + stateRaw.slice(1), tone: "other" };
+    }
+    return undefined;
+  }
+
   function statusFromTimestamp(dateStr: string, thresholdMinutes = 60) {
     if (!dateStr) return { state: "unknown" as const, label: "Status unknown" };
     const t = new Date(dateStr).getTime();
     if (!Number.isFinite(t)) return { state: "unknown" as const, label: "Status unknown" };
-    const minutes = (Date.now() - t) / (60 * 1000);
+    const diffMs = Date.now() - t;
+    // Treat future timestamps as stale (offline) to avoid false "online" from clock skew/future logs
+    if (diffMs < 0) {
+      return {
+        state: "offline" as const,
+        label: `Offline • Last seen ${formatSince(new Date(t).toISOString())}`,
+        lastSeen: new Date(t).toISOString(),
+      };
+    }
+    const minutes = diffMs / (60 * 1000);
     if (minutes <= thresholdMinutes) return { state: "online" as const, label: "Online", lastSeen: new Date(t).toISOString() };
     return {
       state: "offline" as const,
@@ -250,9 +317,17 @@ export default function HomePage() {
           .filter((n: number | null) => Number.isFinite(n)) as number[];
 
         const latest = Math.max(...timestamps, -Infinity);
+        const machineState = deriveMachineState(data.logs || []);
         if (Number.isFinite(latest) || (data.logs || []).length > 0) {
           const lastIso = Number.isFinite(latest) ? new Date(latest).toISOString() : undefined;
-          setStatusInfo({ state: "online", label: "Online", lastSeen: lastIso });
+          const isFresh =
+            lastIso && Date.now() - new Date(lastIso).getTime() <= 60 * 60 * 1000; // 60 minutes freshness
+          if (machineState && isFresh) {
+            setStatusInfo({ state: "online", label: "Online", lastSeen: lastIso, machineState });
+          } else {
+            const label = lastIso ? `Offline • Last seen ${formatSince(lastIso)}` : "Offline";
+            setStatusInfo({ state: "offline", label, lastSeen: lastIso });
+          }
           return;
         }
 
@@ -265,7 +340,8 @@ export default function HomePage() {
       } catch (err) {
         if (controller.signal.aborted) return;
         if (selectedRoaster.lastSeen) {
-          setStatusInfo(statusFromTimestamp(selectedRoaster.lastSeen, 60));
+          const offline = statusFromTimestamp(selectedRoaster.lastSeen, 60);
+          setStatusInfo(offline);
         } else {
           setStatusInfo({ state: "unknown", label: "Status unknown" });
         }
@@ -312,12 +388,35 @@ export default function HomePage() {
   // ==============================
   const filteredRoasters = useMemo(() => {
     const q = search.trim().toLowerCase();
-    if (!q) return roasters;
+    const list = q
+      ? roasters.filter(r =>
+          r.serial.toLowerCase().includes(q) ||
+          (r.machineName || "").toLowerCase().includes(q)
+        )
+      : roasters;
 
-    return roasters.filter(r =>
-      r.serial.toLowerCase().includes(q) ||
-      (r.machineName || "").toLowerCase().includes(q)
-    );
+    const onlineThresholdMinutes = 60;
+    const weight = (r: RoasterSummary) => {
+      if (!r.lastSeen) return -Infinity;
+      const info = statusFromTimestamp(r.lastSeen, onlineThresholdMinutes);
+      return info.state === "online" ? new Date(r.lastSeen).getTime() : -Infinity;
+    };
+
+    // If searching and nothing matches, allow a manual offline entry so user can fetch by serial
+    let augmented = list;
+    if (q && list.length === 0) {
+      augmented = [{
+        serial: q.toUpperCase(),
+        machineName: "(manual entry)",
+      } as RoasterSummary];
+    }
+
+    return [...augmented].sort((a, b) => {
+      const wa = weight(a);
+      const wb = weight(b);
+      if (wa === wb) return a.serial.localeCompare(b.serial);
+      return wb - wa; // online (recent) first
+    });
   }, [roasters, search]);
 
   // ==============================
@@ -328,6 +427,7 @@ export default function HomePage() {
     setRoastPage(null);
     setRoastsError(null);
     setCurrentPage(1);
+    setRoastsLoading(true);
 
     // Set defaults to today's date
     const today = todayLocalISO();
@@ -461,15 +561,6 @@ export default function HomePage() {
                     {r.firmware && <span>FW {r.firmware}</span>}
                   </div>
 
-                  {r.lastSeen && (
-                    <div className="roaster-card-last-seen">
-                      Last seen:
-                      {" " + new Date(r.lastSeen).toLocaleDateString(undefined, {
-                        month: "short",
-                        day: "numeric",
-                      })}
-                    </div>
-                  )}
                 </button>
               );
             })}
@@ -501,6 +592,11 @@ export default function HomePage() {
                   <span className="status-dot" />
                   {statusInfo.label}
                 </span>
+                {statusInfo.machineState && (
+                  <span className={`state-chip state-chip--${statusInfo.machineState.tone}`}>
+                    {statusInfo.machineState.label}
+                  </span>
+                )}
                 {liveLogsUrl && (
                   <a className="status-link" href={liveLogsUrl} target="_blank" rel="noopener noreferrer">
                     Live logs →
@@ -540,6 +636,14 @@ export default function HomePage() {
               {/* ERRORS */}
               {roastsError && <div className="error error--spaced">{roastsError}</div>}
 
+              {/* LOADING OVERLAY */}
+              {roastsLoading && (
+                <div className="loading-overlay">
+                  <div className="loading-bar" />
+                  <div className="loading-text">Loading roasts… Please wait!</div>
+                </div>
+              )}
+
               {/* TABLE */}
               {roastPage && roastPage.roasts.length > 0 && (
                 <>
@@ -549,10 +653,12 @@ export default function HomePage() {
     <th>Roast ID</th>
     <th>Roast Profile ID</th>
     <th>Date</th>
+    <th>Roast Seq</th>
     <th>Start Time</th>
     <th>End Time</th>
     <th>Duration</th>
     <th>Active Alarms</th>
+    <th>Roast Status</th>
     <th>Cooling Duration</th>
     <th>Download Logs</th>
     <th>GCP Logs</th>
@@ -565,6 +671,7 @@ export default function HomePage() {
       <td className="mono">{r.id}</td>
       <td className="mono">{r.roastProfileId || "N/A"}</td>
       <td>{formatDateTime(r.startTime, timeZone).split(",")[0]}</td>
+      <td>{Number.isFinite(r.roastSeq as number) ? r.roastSeq : "-"}</td>
       <td>{formatTime(r.startTime, timeZone)}</td>
       <td>{r.endTime ? formatTime(r.endTime, timeZone) : "N/A"}</td>
       <td>{r.endTime ? formatDuration(r.durationSeconds) : "N/A"}</td>
@@ -591,6 +698,12 @@ export default function HomePage() {
                 ) : (
           <span className="tag tag--ok">✗ No</span>
         )}
+      </td>
+      <td>
+        {r.status === "success" && <span className="pill pill--success">Success</span>}
+        {r.status === "in_progress" && <span className="pill pill--inprogress">In Progress</span>}
+        {r.status === "failed" && <span className="pill pill--failed">Failed / Aborted</span>}
+        {!r.status && <span className="pill pill--unknown">Unknown</span>}
       </td>
       <td>
         {r.coolingDurationSeconds && r.coolingDurationSeconds > 0
@@ -657,7 +770,7 @@ export default function HomePage() {
 
               {/* EMPTY STATE */}
               {roastPage && roastPage.roasts.length === 0 && !roastsLoading && (
-                <div className="info info--spaced">No roasts found for this range.</div>
+                <div className="info info--spaced">No roasts found for the selected range.</div>
               )}
             </>
           )}

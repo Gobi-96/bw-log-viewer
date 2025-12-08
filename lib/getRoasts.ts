@@ -67,6 +67,18 @@ function extractAlarmName(text: string): string | null {
     }
   }
 
+  // Prefer Tag when present (avoids showing Verb duplicate)
+  const tagFieldMatch = text.match(/Tag=([A-Za-z0-9_\-]+)/);
+  if (tagFieldMatch && tagFieldMatch[1]) {
+    return tagFieldMatch[1].trim();
+  }
+
+  // AST Preheat_Timeout ... "Preheat_Timed_Out" → take first token after AST
+  const astMatch = text.match(/\bAST\s+([A-Za-z0-9_]+)/i);
+  if (astMatch && astMatch[1]) {
+    return astMatch[1].trim();
+  }
+
   const alarmMatch = text.match(/ALARM[:\s-]*([^,;\n\r]+)/i);
   if (alarmMatch && alarmMatch[1]) {
     return alarmMatch[1].trim();
@@ -99,6 +111,31 @@ function normalizeAlarmNames(raw: string | null): string[] {
     "setTag",
     "Tag",
     "Name",
+    "FAIL",
+    "fail",
+    "VERB",
+    "VERB=Preheat_Timed_Out",
+    "VERB=Beans_Not_Confirmed",
+    "VERB=Tray_Full",
+    "Preheat",
+    "Timed",
+    "Out",
+    "Beans",
+    "Not",
+    "Confirmed",
+    "continue",
+    "due",
+    "command",
+    "blocked",
+    "check",
+    "tray",
+    "beans",
+    "clear",
+    "AutoCollector",
+    "bean",
+    "exit",
+    "Tag",
+    "Verb",
   ]);
   const names: string[] = [];
   for (const m of matches) {
@@ -111,14 +148,20 @@ function normalizeAlarmNames(raw: string | null): string[] {
     }
 
     // normalize Main_Blower_RuntimeFail/MainBlowerRuntime_Fail variants to a single token
-    const normalized = m.replace(/Runtime_Fail/i, "RuntimeFail").replace(/_/g, "_");
+    const normalized = m
+      .replace(/Runtime_Fail/i, "RuntimeFail")
+      .replace(/VERB=/i, "")
+      .replace(/_/g, "_");
     names.push(normalized);
   }
   // Deduplicate while preserving order; prefer collapsing camel vs underscore duplicates
   const seen = new Set<string>();
   const unique: string[] = [];
   for (const n of names) {
-    const key = n.replace(/_/g, "").toLowerCase();
+    const key = n
+      .replace(/_/g, "")
+      .replace(/timedout/gi, "timeout")
+      .toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
     unique.push(n);
@@ -168,6 +211,8 @@ timestamp <= "${endIso}"
   });
 
   let coolingSeconds: number | null = null;
+  let coolingEndTimestamp: string | null = null;
+  let sawReached = false;
 
   for (const entry of entries) {
     const ts = normalizeTs((entry as any).timestamp || (entry as any).metadata?.timestamp);
@@ -175,14 +220,23 @@ timestamp <= "${endIso}"
     const text = messageFromEntry(entry);
     if (!text) continue;
 
+    const reached = /bean\s+cooler\s+reached/i.test(text);
     const parsed = parseCoolingDuration(text);
-    if (parsed) {
+    if (parsed && !sawReached) {
       coolingSeconds = parsed.seconds;
+    }
+
+    if (!coolingEndTimestamp && reached) {
+      coolingEndTimestamp = ts;
+      sawReached = true;
+      // Stop scanning once we hit the Bean Cooler reached marker to avoid picking up later Cool logs
+      break;
     }
   }
 
   return {
     coolingDurationSeconds: coolingSeconds,
+    coolingEndTimestamp: coolingEndTimestamp || undefined,
   };
 }
 
@@ -217,36 +271,66 @@ timestamp <= "${endIso}"
   return "";
 }
 
+async function fetchRoastSeq(
+  serial: string,
+  startIso: string,
+  endIso: string
+): Promise<number | null> {
+  const filter = `
+logName="projects/bw-core/logs/roaster"
+labels.serial="${serial}"
+timestamp >= "${startIso}"
+timestamp <= "${endIso}"
+(textPayload:"roast_seq=" OR jsonPayload.message:"roast_seq=")
+`.trim();
+
+  const [entries] = await logging.getEntries({
+    filter,
+    orderBy: "timestamp asc",
+    pageSize: 100,
+  });
+
+  for (const entry of entries) {
+    const text = messageFromEntry(entry);
+    if (!text) continue;
+    const match = text.match(/roast_seq\s*=\s*([0-9]+)/i);
+    if (match && match[1]) {
+      const num = Number(match[1]);
+      if (Number.isFinite(num)) return num;
+    }
+  }
+
+  return null;
+}
+
 async function fetchRoastAlarms(
   serial: string,
   startIso: string,
   endIso: string,
   endBoundary?: string
 ): Promise<AlarmHit[]> {
+  const endWithBuffer = addMinutes(endIso, 10); // allow alarms slightly after end
   const filter = `
 logName="projects/bw-core/logs/roaster"
 labels.serial="${serial}"
 timestamp >= "${startIso}"
-timestamp <= "${endIso}"
+timestamp <= "${endWithBuffer}"
 (textPayload:"ALARM" OR textPayload:"Alarm" OR textPayload:"ActiveAlarms" OR jsonPayload.message:"ALARM" OR jsonPayload.message:"Alarm" OR jsonPayload.message:"ActiveAlarms")
 `.trim();
 
   const [entries] = await logging.getEntries({
     filter,
     orderBy: "timestamp asc",
-    pageSize: 200,
+    pageSize: 400,
   });
 
   const alarms = new Map<string, string | undefined>();
-  let seenActive = false;
 
   for (const entry of entries) {
-    if (seenActive) break;
-
     const ts = normalizeTs((entry as any).timestamp || (entry as any).metadata?.timestamp);
     if (!ts) continue;
     if (ts < startIso) continue;
-    if (ts > endIso) break;
+    if (ts > endWithBuffer) break;
 
     const text = messageFromEntry(entry);
     if (!text) continue;
@@ -257,9 +341,6 @@ timestamp <= "${endIso}"
     // Skip empty ActiveAlarms sections
     const isActiveSection = /ActiveAlarms/i.test(text);
     if (/ActiveAlarms:\s*\[\s*\]/i.test(text)) {
-      if (isActiveSection && (endBoundary ? ts >= endBoundary : true)) {
-        seenActive = true;
-      }
       continue;
     }
 
@@ -271,10 +352,7 @@ timestamp <= "${endIso}"
       }
     }
 
-    const pastEnd = endBoundary ? ts >= endBoundary : true;
-    if (isActiveSection && pastEnd) {
-      seenActive = true;
-    }
+    // Do not short-circuit; allow multiple alarm lines to be collected
   }
 
   return Array.from(alarms.entries()).map(([name, ts]) => ({ name, timestamp: ts }));
@@ -287,6 +365,10 @@ export async function getRoasts(
   page: number,
   pageSize: number
 ) {
+  if (!from || !to) {
+    throw new Error("Missing from/to range");
+  }
+
   const roastIds = await getRoastIds(serial, from, to);
   // Collapse multiple log hits into a single roast row
   const grouped = new Map<
@@ -353,21 +435,9 @@ export async function getRoasts(
 
   const roasts = await Promise.all(
     slice.map(async r => {
-      const durationSeconds = r.startTime && r.endTime
+      let durationSeconds = r.startTime && r.endTime
         ? Math.max(0, (new Date(r.endTime).getTime() - new Date(r.startTime).getTime()) / 1000)
         : 0;
-
-      // Filter to this roaster's serial and exclude roastctl by pinning logName to roaster.
-      const query = encodeURIComponent(
-        `labels.serial="${serial}" logName="projects/bw-core/logs/roaster"`
-      );
-      const startWindow = from || r.startTime;
-      const computedEnd = r.endTime && r.endTime !== "" ? r.endTime : new Date(new Date(r.startTime).getTime() + 60 * 60 * 1000).toISOString();
-      const endWindow = to || computedEnd;
-
-      const startParam = startWindow ? `;startTime=${encodeURIComponent(startWindow)}` : "";
-      const endParam = endWindow ? `;endTime=${encodeURIComponent(endWindow)}` : "";
-      const cursorParam = r.startTime ? `;cursorTimestamp=${encodeURIComponent(r.startTime)}` : "";
 
       // Fetch alarms in the roast window
       let alarms: AlarmHit[] = [];
@@ -384,29 +454,73 @@ export async function getRoasts(
       // Cooling info (search from roast end to a reasonable window)
       let coolingDurationSeconds: number | null = null;
       let roastProfileId = "";
+      let status: "success" | "in_progress" | "failed" = "in_progress";
+      let inferredEndTime: string | null = null;
+      let roastSeq: number | null = null;
       try {
-        const coolingStart = r.endTime && r.endTime !== "" ? r.endTime : r.startTime;
-        const coolingEndWindow = addMinutes(coolingStart, 120);
-        const cooling = await fetchCoolingInfo(serial, coolingStart, coolingEndWindow);
+        // Search cooling from roast start through end + 120m (captures cooling logs before final end marker)
+        const coolingWindowStart = r.startTime;
+        const coolingWindowEnd = addMinutes(r.endTime && r.endTime !== "" ? r.endTime : r.startTime, 120);
+        const cooling = await fetchCoolingInfo(serial, coolingWindowStart, coolingWindowEnd);
         if (Number.isFinite(cooling.coolingDurationSeconds as number)) {
           coolingDurationSeconds = cooling.coolingDurationSeconds as number;
         }
+        // Fallback: if we never saw an explicit end marker, anchor the end to the first Bean Cooler reached log.
+        if ((!r.endTime || r.endTime === r.startTime) && cooling.coolingEndTimestamp) {
+          inferredEndTime = cooling.coolingEndTimestamp;
+        }
 
         // Roast Profile ID lookup near roast start window
-        roastProfileId = await fetchRoastProfileId(serial, r.startTime, coolingEndWindow);
+        roastProfileId = await fetchRoastProfileId(serial, r.startTime, coolingWindowEnd);
+        // Roast sequence lookup (external message)
+        roastSeq = await fetchRoastSeq(serial, r.startTime, coolingWindowEnd);
       } catch (err) {
         console.error("Error fetching cooling for", r.id, err);
       }
 
+      const effectiveEndTime = r.endTime && r.endTime !== r.startTime
+        ? r.endTime
+        : inferredEndTime || "";
+
+      // Recompute duration with fallback end time when explicit end is missing
+      durationSeconds = r.startTime && effectiveEndTime
+        ? Math.max(0, (new Date(effectiveEndTime).getTime() - new Date(r.startTime).getTime()) / 1000)
+        : durationSeconds;
+
+      // Roast status: success if end exists and we observed cooling; in_progress if end missing; else failed/aborted
+      if (!effectiveEndTime) {
+        status = "in_progress";
+      } else if (coolingDurationSeconds && coolingDurationSeconds > 0) {
+        status = "success";
+      } else {
+        status = "failed";
+      }
+
+      // Filter to this roaster's serial and exclude roastctl by pinning logName to roaster.
+      const query = encodeURIComponent(
+        `labels.serial="${serial}" logName="projects/bw-core/logs/roaster"`
+      );
+      const startWindow = from || r.startTime;
+      const computedEnd = effectiveEndTime && effectiveEndTime !== ""
+        ? effectiveEndTime
+        : new Date(new Date(r.startTime).getTime() + 60 * 60 * 1000).toISOString();
+      const endWindow = to || computedEnd;
+
+      const startParam = startWindow ? `;startTime=${encodeURIComponent(startWindow)}` : "";
+      const endParam = endWindow ? `;endTime=${encodeURIComponent(endWindow)}` : "";
+      const cursorParam = r.startTime ? `;cursorTimestamp=${encodeURIComponent(r.startTime)}` : "";
+
       return {
         id: r.id,
         startTime: r.startTime,
-        endTime: r.endTime && r.endTime !== r.startTime ? r.endTime : "",
+        endTime: effectiveEndTime,
         durationSeconds,
         hasAlarms: alarms.length > 0,
         alarms,
         coolingDurationSeconds: coolingDurationSeconds ?? null,
         roastProfileId,
+        roastSeq: roastSeq ?? undefined,
+        status,
         gcpLink: `https://console.cloud.google.com/logs/query;query=${query}${startParam}${endParam}${cursorParam}?project=bw-core`,
       };
     })
