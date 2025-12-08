@@ -71,7 +71,7 @@ export async function getRoastIds(
   fromIso: string,
   toIso: string
 ) {
-  console.log("🔥 ROAST ID SEARCH WINDOW:", fromIso, "→", toIso);
+  console.log("Roast ID search window:", fromIso, "→", toIso);
 
   // EXACT terminal-equivalent filter
   const filter = `
@@ -96,12 +96,12 @@ timestamp < "${toIso}"
     orderBy: "timestamp asc",
   });
 
-  console.log("🔥 Raw Roast Log Count:", entries.length);
+  console.log("Raw roast log count:", entries.length);
   if (entries.length > 0) {
     const sample: any = entries[0];
-    console.log("🔥 Sample entry keys:", Object.keys(sample));
+    console.log("Sample entry keys:", Object.keys(sample));
     try {
-      console.log("🔥 Sample entry data:", JSON.stringify(sample.data || sample.textPayload || sample, null, 2).slice(0, 800));
+      console.log("Sample entry data:", JSON.stringify(sample.data || sample.textPayload || sample, null, 2).slice(0, 800));
     } catch {
       // ignore
     }
@@ -129,6 +129,6 @@ timestamp < "${toIso}"
     });
   }
 
-  console.log("🔥 Extracted Roast IDss:", results.length);
+  console.log("Extracted roast IDs:", results.length);
   return results;
 }
