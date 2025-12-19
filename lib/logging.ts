@@ -7,3 +7,4 @@ export const projectId =
   "bw-core";
 
 export const logging = new Logging({ projectId });
+export const logProjectId = projectId;
