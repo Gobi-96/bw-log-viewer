@@ -2,6 +2,7 @@
 "use client";
 
 import React, { useEffect, useState, useMemo } from "react";
+import dynamic from "next/dynamic";
 
 interface RoasterSummary {
   serial: string;
@@ -31,6 +32,25 @@ interface RoastPage {
   total: number;
   roasts: RoastSummary[];
 }
+
+type PlotRow = {
+  time: number;
+  beanFront: number | string;
+  drumBottom: number | string;
+  heaterOut: number | string;
+  inlet: number | string;
+  bypassExit: number | string;
+  adjustedTimeMMSS: string;
+};
+
+type MeasurementRow = {
+  time: number;
+  temp: number | string;
+  skin: number | string;
+  adjustedTimeMMSS: string;
+};
+
+const Plot = dynamic(() => import("react-plotly.js"), { ssr: false });
 
 function formatDateTime(iso: string, timeZone?: string) {
   if (!iso) return "";
@@ -89,6 +109,157 @@ export default function HomePage() {
     machineState?: { label: string; tone: "ready" | "preheat" | "roast" | "cool" | "standby" | "other" };
   }>({ state: "unknown", label: "Status unknown" });
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
+  const [plotRows, setPlotRows] = useState<PlotRow[]>([]);
+  const [graphRows, setGraphRows] = useState<MeasurementRow[]>([]);
+  const [plotLoadingId, setPlotLoadingId] = useState<string | null>(null);
+  const [graphLoadingId, setGraphLoadingId] = useState<string | null>(null);
+  const [dataError, setDataError] = useState<string | null>(null);
+  const [showPlotModal, setShowPlotModal] = useState(false);
+  const [showGraphModal, setShowGraphModal] = useState(false);
+  const [plotCache, setPlotCache] = useState<Record<string, Record<string, PlotRow[]>>>({});
+  const [graphCache, setGraphCache] = useState<Record<string, Record<string, MeasurementRow[]>>>({});
+  const [roastsCache, setRoastsCache] = useState<
+    Record<string, Record<string, Record<number, RoastPage>>>
+  >({});
+  const [roastsAbortController, setRoastsAbortController] = useState<AbortController | null>(null);
+  const [roastsProgress, setRoastsProgress] = useState<number>(0);
+  const formatMMSS = (seconds: number) => {
+    const s = Math.max(0, Math.round(seconds));
+    const mm = Math.floor(s / 60)
+      .toString()
+      .padStart(2, "0");
+    const ss = (s % 60).toString().padStart(2, "0");
+    return `${mm}:${ss}`;
+  };
+  const closePlotModal = () => {
+    setShowPlotModal(false);
+    setPlotRows([]);
+    setDataError(null);
+  };
+  const closeGraphModal = () => {
+    setShowGraphModal(false);
+    setGraphRows([]);
+    setDataError(null);
+  };
+  const plotTraces = useMemo(() => {
+    if (!plotRows.length) return [];
+    const series = [
+      { key: "beanFront", name: "Bean Temp", axis: "y" },
+      { key: "drumBottom", name: "Drum Temp", axis: "y" },
+      { key: "heaterOut", name: "Heater Out", axis: "y2" },
+      { key: "inlet", name: "Inlet Temp", axis: "y" },
+      { key: "bypassExit", name: "Bypass Exit", axis: "y" },
+      { key: "beanCooler", name: "Bean Cooler", axis: "y2" },
+      { key: "airSPF", name: "Air SPF", axis: "y2" },
+      { key: "airPWM", name: "Air PWM", axis: "y2" },
+      { key: "bluLbs", name: "BLU Lbs", axis: "y2" },
+      { key: "bluCooler", name: "BLU Cooler", axis: "y2" },
+      { key: "bluTray", name: "BLU Tray", axis: "y2" },
+      { key: "bluTrayReady", name: "BLU Tray Ready", axis: "y2" },
+      { key: "inletSPF", name: "Inlet SPF", axis: "y2" },
+      { key: "roastSPF", name: "Roast SPF", axis: "y" },
+      { key: "roastError", name: "Roast Error", axis: "y2" },
+      { key: "bypassPos", name: "Bypass Pos", axis: "y2" },
+      { key: "hopperState", name: "Hopper State", axis: "y2" },
+      { key: "load", name: "Load", axis: "y2" },
+      { key: "drop", name: "Drop", axis: "y2" },
+      { key: "trayPresent", name: "Tray Present", axis: "y2" },
+      { key: "trayStatus", name: "Tray Status", axis: "y2" },
+      { key: "beanCollector", name: "Bean Collector", axis: "y2" },
+      { key: "chaffCollector", name: "Chaff Collector", axis: "y2" },
+      { key: "mbPCT", name: "MB %", axis: "y2" },
+      { key: "mbHz", name: "MB Hz", axis: "y2" },
+      { key: "exhstPct", name: "Exhaust %", axis: "y2" },
+      { key: "exhstHz1", name: "Exhaust Hz1", axis: "y2" },
+      { key: "exhstHz2", name: "Exhaust Hz2", axis: "y2" },
+      { key: "coolTarget", name: "Cool Target", axis: "y2" },
+      { key: "htrVrms", name: "Heater Vrms", axis: "y2" },
+      { key: "htrIrms", name: "Heater Irms", axis: "y2" },
+      { key: "iF", name: "IF", axis: "y2" },
+      { key: "interLock", name: "Interlock", axis: "y2" },
+      { key: "ror", name: "RoR", axis: "y2" },
+    ];
+    return series
+      .map(s => ({
+        x: plotRows.map(p => p.adjustedTimeMMSS || formatMMSS(p.time)),
+        y: plotRows.map(p => (p as any)[s.key]),
+        type: "scatter" as const,
+        mode: "lines" as const,
+        name: s.name,
+        yaxis: s.axis === "y2" ? "y2" : undefined,
+      }))
+      .filter(t => t.y.some(v => typeof v === "number"));
+  }, [plotRows]);
+
+  const plotStateBands = useMemo(() => {
+    if (!plotRows.length) return [];
+    const bands: { state: string; start: number; end: number }[] = [];
+    let currentState = plotRows[0].state || "";
+    let start = plotRows[0].time;
+
+    for (let i = 1; i < plotRows.length; i++) {
+      const row = plotRows[i];
+      if (row.state !== currentState) {
+        bands.push({ state: currentState, start, end: row.time });
+        currentState = row.state || "";
+        start = row.time;
+      }
+    }
+    bands.push({
+      state: currentState,
+      start,
+      end: plotRows[plotRows.length - 1].time,
+    });
+    return bands.map(b => {
+      const startLabel = formatMMSS(b.start);
+      const endLabel = formatMMSS(b.end);
+      const mid = (b.start + b.end) / 2;
+      const midLabel = formatMMSS(mid);
+      return {
+        state: b.state,
+        start: startLabel,
+        end: endLabel,
+        mid: midLabel,
+      };
+    });
+  }, [plotRows]);
+
+  const graphTraces = useMemo(() => {
+    if (!graphRows.length) return [];
+    const startTime = graphRows[0].time || 0;
+    const xLabels = graphRows.map(g => formatMMSS(Math.max(0, g.time - startTime)));
+    return [
+      {
+        x: xLabels,
+        y: graphRows.map(g => g.temp),
+        type: "scatter",
+        mode: "lines",
+        name: "Bean Temp",
+      },
+      {
+        x: xLabels,
+        y: graphRows.map(g => g.skin),
+        type: "scatter",
+        mode: "lines",
+        name: "Drum Temp",
+      },
+      {
+        x: xLabels,
+        y: graphRows.map(g => g.referenceTemp ?? null),
+        type: "scatter",
+        mode: "lines",
+        name: "Reference Temp",
+      },
+      {
+        x: xLabels,
+        y: graphRows.map(g => g.ror ?? null),
+        type: "scatter",
+        mode: "lines",
+        name: "RoR",
+        yaxis: "y2",
+      },
+    ];
+  }, [graphRows]);
 
   const pageSize = 10;
 
@@ -210,6 +381,94 @@ export default function HomePage() {
       setRoastsError("Failed to download logs");
     } finally {
       setDownloadingId(null);
+    }
+  }
+
+  async function handleLoadPlots(roast: RoastSummary) {
+    if (!selectedRoaster) return;
+    const roasterKey = selectedRoaster.serial;
+    const cached = plotCache[roasterKey]?.[roast.id];
+    if (cached) {
+      setPlotRows(cached);
+      setShowPlotModal(true);
+      return;
+    }
+    setPlotLoadingId(roast.id);
+    setDataError(null);
+    try {
+      const params = new URLSearchParams();
+      params.set("serial", selectedRoaster.serial);
+      params.set("roastId", roast.id);
+      params.set("start", roast.startTime);
+      if (roast.endTime) params.set("end", roast.endTime);
+      params.set("slackSeconds", "10");
+
+      const res = await fetch(`/api/plots?${params.toString()}`);
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || `HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      const rows = data.plots || [];
+      setPlotRows(rows);
+      setPlotCache(prev => ({
+        ...prev,
+        [roasterKey]: {
+          ...(prev[roasterKey] || {}),
+          [roast.id]: rows,
+        },
+      }));
+      setShowPlotModal(true);
+    } catch (err) {
+      console.error("Failed to load plots", err);
+      setDataError(err instanceof Error ? err.message : "Failed to load plots");
+      setPlotRows([]);
+    } finally {
+      setPlotLoadingId(null);
+    }
+  }
+
+  async function handleLoadGraph(roast: RoastSummary) {
+    if (!selectedRoaster) return;
+    const roasterKey = selectedRoaster.serial;
+    const cached = graphCache[roasterKey]?.[roast.id];
+    if (cached) {
+      setGraphRows(cached);
+      setShowGraphModal(true);
+      return;
+    }
+    setGraphLoadingId(roast.id);
+    setDataError(null);
+    try {
+      const params = new URLSearchParams();
+      params.set("serial", selectedRoaster.serial);
+      params.set("roastId", roast.id);
+      params.set("start", roast.startTime);
+      if (roast.endTime) params.set("end", roast.endTime);
+      params.set("slackSeconds", "10");
+
+      const res = await fetch(`/api/graph?${params.toString()}`);
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || `HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      const rows = data.measurements || [];
+      setGraphRows(rows);
+      setGraphCache(prev => ({
+        ...prev,
+        [roasterKey]: {
+          ...(prev[roasterKey] || {}),
+          [roast.id]: rows,
+        },
+      }));
+      setShowGraphModal(true);
+    } catch (err) {
+      console.error("Failed to load graph", err);
+      setDataError(err instanceof Error ? err.message : "Failed to load graph");
+      setGraphRows([]);
+    } finally {
+      setGraphLoadingId(null);
     }
   }
 
@@ -426,6 +685,12 @@ export default function HomePage() {
     setSelectedRoaster(roaster);
     setRoastPage(null);
     setRoastsError(null);
+    setPlotRows([]);
+    setGraphRows([]);
+    setPlotCache({});
+    setGraphCache({});
+    setRoastsCache({});
+    setRoastsAbortController(null);
     setCurrentPage(1);
     setRoastsLoading(true);
 
@@ -450,6 +715,11 @@ export default function HomePage() {
     return local.toISOString();
   }
   
+  function cancelRoastFetch() {
+    if (roastsAbortController) {
+      roastsAbortController.abort();
+    }
+  }
 
   // ==============================
   // FETCH ROASTS
@@ -461,7 +731,23 @@ export default function HomePage() {
     const roaster = overrides?.roaster ?? selectedRoaster;
     if (!roaster) return;
 
+    // Build cache key (roaster + date range)
+    const fromIso = overrides?.from ?? combineDateTime(fromDate, fromTime);
+    const toIso = overrides?.to ?? combineDateTime(toDate, toTime);
+    const rangeKey = `${fromIso}|${toIso}`;
+
+    // Serve from cache if present
+    const cachedPage = roastsCache[roaster.serial]?.[rangeKey]?.[page];
+    if (cachedPage) {
+      setRoastPage(cachedPage);
+      setCurrentPage(cachedPage.page);
+      setRoastsError(null);
+      setRoastsLoading(false);
+      return;
+    }
+
     setRoastsLoading(true);
+    setRoastsProgress(5);
     setRoastsError(null);
 
     if (!overrides?.from && (!fromDate || !toDate)) {
@@ -470,10 +756,6 @@ export default function HomePage() {
       return;
     }
 
-    const fromIso = overrides?.from ?? combineDateTime(fromDate, fromTime);
-    const toIso = overrides?.to ?? combineDateTime(toDate, toTime);
-
-
     const params = new URLSearchParams();
     params.set("serial", roaster.serial);
     params.set("from", fromIso);
@@ -481,17 +763,41 @@ export default function HomePage() {
     params.set("page", String(page));
     params.set("pageSize", String(pageSize));    
 
+    const controller = new AbortController();
+    setRoastsAbortController(controller);
+    const progressTimer = setInterval(() => {
+      setRoastsProgress(prev => (prev < 90 ? prev + 5 : prev));
+    }, 200);
+
     try {
-      const res = await fetch(`/api/roasts?${params.toString()}`);
+      const res = await fetch(`/api/roasts?${params.toString()}`, { signal: controller.signal });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
       const data = (await res.json()) as RoastPage;
       setRoastPage(data);
       setCurrentPage(data.page);
+      setRoastsCache(prev => ({
+        ...prev,
+        [roaster.serial]: {
+          ...(prev[roaster.serial] || {}),
+          [rangeKey]: {
+            ...((prev[roaster.serial] || {})[rangeKey] || {}),
+            [page]: data,
+          },
+        },
+      }));
+      setRoastsProgress(100);
     } catch (err: any) {
-      setRoastsError(err.message || "Failed to load roasts");
+      if (err?.name === "AbortError") {
+        setRoastsError("Request canceled by user");
+      } else {
+        setRoastsError(err.message || "Failed to load roasts");
+      }
     } finally {
+      clearInterval(progressTimer);
       setRoastsLoading(false);
+      setRoastsAbortController(null);
+      setTimeout(() => setRoastsProgress(0), 300);
     }
   }
 
@@ -627,8 +933,12 @@ export default function HomePage() {
 
                 <div className="date-actions">
                   <div className="timezone-label">Timezone: {timeZone || "local device"}</div>
-                  <button className="primary-btn" onClick={handleLoadRoasts} disabled={roastsLoading}>
-                    {roastsLoading ? "Loading…" : "Load Roasts"}
+                  <button
+                    className={`primary-btn ${roastsLoading ? "primary-btn--loading" : ""}`}
+                    onClick={roastsLoading ? cancelRoastFetch : handleLoadRoasts}
+                    title={roastsLoading ? "Click to cancel" : "Load roasts"}
+                  >
+                    {roastsLoading ? "Cancel" : "Load Roasts"}
                   </button>
                 </div>
               </div>
@@ -640,12 +950,12 @@ export default function HomePage() {
               {roastsLoading && (
                 <div className="loading-overlay">
                   <div className="loading-bar" />
-                  <div className="loading-text">Loading roasts… Please wait!</div>
+                  <div className="loading-text">Loading roasts… {roastsProgress}%</div>
                 </div>
               )}
 
               {/* TABLE */}
-              {roastPage && roastPage.roasts.length > 0 && (
+              {!roastsLoading && roastPage && roastPage.roasts.length > 0 && (
                 <>
                   <table className="roast-table">
   <thead>
@@ -661,6 +971,7 @@ export default function HomePage() {
     <th>Roast Status</th>
     <th>Cooling Duration</th>
     <th>Download Logs</th>
+    <th>Data</th>
     <th>GCP Logs</th>
   </tr>
 </thead>
@@ -720,6 +1031,24 @@ export default function HomePage() {
           {downloadingId === r.id ? "⏳" : "⬇"}
         </button>
       </td>
+      <td className="space-x-2">
+        <button
+          className="icon-btn"
+          title="Load plots"
+          onClick={() => handleLoadPlots(r)}
+          disabled={plotLoadingId === r.id}
+        >
+          {plotLoadingId === r.id ? "…" : "Plot"}
+        </button>
+        <button
+          className="icon-btn"
+          title="Load measurements"
+          onClick={() => handleLoadGraph(r)}
+          disabled={graphLoadingId === r.id}
+        >
+          {graphLoadingId === r.id ? "…" : "Graph"}
+        </button>
+      </td>
       <td>
         <a
           href={r.gcpLink}
@@ -776,6 +1105,152 @@ export default function HomePage() {
           )}
         </section>
       </main>
+
+      {/* Plot modal */}
+      {showPlotModal && plotRows.length > 0 && (
+      <div className="modal-backdrop">
+        <div className="modal-card modal-card--full">
+          <div className="modal-header">
+            <h3>Plot Data</h3>
+            <button className="icon-btn" onClick={closePlotModal}>
+                ✕
+              </button>
+            </div>
+            <div className="modal-body">
+              <Plot
+                data={plotTraces}
+                layout={{
+                  margin: { t: 10, r: 60, l: 70, b: 60 },
+                  xaxis: { title: "Time (mm:ss)" },
+                  yaxis: { title: "Temp (°F)", range: [0, 5000] },
+                  yaxis2: { title: "Outputs / Actuators", overlaying: "y", side: "right" },
+                  showlegend: true,
+                  shapes: plotStateBands.map(b => ({
+                    type: "rect",
+                    xref: "x",
+                    yref: "paper",
+                    x0: b.start,
+                    x1: b.end,
+                    y0: 0,
+                    y1: 1,
+                    fillcolor:
+                      (b.state || "").toLowerCase() === "roast"
+                        ? "rgba(0,128,0,0.08)"
+                        : (b.state || "").toLowerCase() === "preheat"
+                        ? "rgba(255,165,0,0.08)"
+                        : "rgba(30,144,255,0.08)",
+                    line: { width: 0 },
+                  })),
+                  annotations: plotStateBands.map(b => ({
+                    x: b.mid,
+                    y: 1.02,
+                    xref: "x",
+                    yref: "paper",
+                    text: b.state || "",
+                    showarrow: false,
+                    font: { size: 11, color: "#444" },
+                  })),
+                  legend: {
+                    orientation: "h",
+                    x: 0,
+                    y: -0.08,
+                    yanchor: "top",
+                    xanchor: "left",
+                  },
+                }}
+                config={{ displayModeBar: true, responsive: true, scrollZoom: true }}
+                style={{ width: "100%", height: "100%" }}
+              />
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Graph modal */}
+      {showGraphModal && graphRows.length > 0 && (
+      <div className="modal-backdrop">
+        <div className="modal-card modal-card--full">
+          <div className="modal-header">
+            <h3>Measurements</h3>
+            <button className="icon-btn" onClick={closeGraphModal}>
+                ✕
+              </button>
+            </div>
+            <div className="modal-body">
+              <Plot
+                data={graphTraces}
+                layout={{
+                  margin: { t: 10, r: 60, l: 70, b: 60 },
+                  xaxis: { title: "Time (mm:ss)" },
+                  yaxis: { title: "Temp (°F)", range: [50, 500] },
+                  yaxis2: { title: "RoR (°F/min)", overlaying: "y", side: "right", range: [0, 45] },
+                  showlegend: true,
+                  legend: {
+                    orientation: "h",
+                    x: 0,
+                    y: -0.08,
+                    yanchor: "top",
+                    xanchor: "left",
+                  },
+                }}
+                config={{ displayModeBar: true, responsive: true, scrollZoom: true }}
+                style={{ width: "100%", height: "100%" }}
+              />
+            </div>
+          </div>
+        </div>
+      )}
+
+      <style jsx global>{`
+        .modal-backdrop {
+          position: fixed;
+          inset: 0;
+          background: rgba(0, 0, 0, 0.6);
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          z-index: 1000;
+        }
+        .modal-card {
+          width: min(1200px, 90vw);
+          background: #fff;
+          border-radius: 12px;
+          box-shadow: 0 10px 40px rgba(0, 0, 0, 0.25);
+          display: flex;
+          flex-direction: column;
+          max-height: 90vh;
+        }
+        .modal-card--full {
+          width: 100vw;
+          height: 100vh;
+          border-radius: 0;
+          max-height: 100vh;
+          display: flex;
+          flex-direction: column;
+        }
+        .modal-header {
+          padding: 12px 16px;
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          border-bottom: 1px solid #e5e5e5;
+        }
+        .modal-body {
+          padding: 8px 12px 14px;
+          flex: 1;
+          display: flex;
+        }
+        .icon-btn {
+          border: 1px solid #d1d1d1;
+          background: #f8f8f8;
+          border-radius: 6px;
+          padding: 6px 10px;
+          cursor: pointer;
+        }
+        .icon-btn:hover {
+          background: #eee;
+        }
+      `}</style>
     </div>
   );
 }
