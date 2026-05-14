@@ -1,4 +1,4 @@
-  # Bellwether Log Viewer (Next.js)
+  # Log Viewer (Next.js)
 
   Small Next.js app to browse Bellwether roaster logs from Google Cloud Logging. The backend talks directly to Cloud Logging; the frontend is a React UI for searching, paging,
   and exporting roast logs.
